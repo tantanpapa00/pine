@@ -1,0 +1,401 @@
+//@version=6
+strategy("BTC/ETH Spot Cycle Martingale v2 - Clean Rebuild",
+     overlay=true,
+     pyramiding=50,
+     default_qty_type=strategy.fixed,
+     commission_type=strategy.commission.percent,
+     commission_value=0.04)
+
+// ============================================================================
+// Clean, from-scratch implementation based on our final spec:
+// - 현물 롱 전용
+// - 4H 종가 확정 신호(CCI <= -100 && close < BB lower)로만 매수 트리거
+// - 일봉 EMA200으로 레짐(상승/하락) 분기
+// - 사이클(1..6) 분할매수: 1차 체결 이후 cFirstPx / cAvg 기준으로 추가매수
+// - 사이클 상태(cCost/cQty/cAvg/cFirstPx)는 "실제 체결(posIncreased)" 시점에만 갱신
+// - tpBaseAvg (전체평단) : "매수 체결(posIncreased) 시점마다" strategy.position_avg_price로 갱신
+// - TP : tpBaseAvg 기준 + n * tpStep% 목표. 각 TP 단계에서 position의 tpSellPct% 매도.
+// - tpNext 는 TP 주문이 실제로 체결(posReduced)되어 포지션이 감소될 때만 증가.
+// - 한 봉당 TP는 최대 1회 (lastTPBar 락). 같은 바의 매수 체결 시 TP 차단(lastBuyBar).
+// - 주문(place) 시 qty_percent 사용 금지. qty = (strategy.equity * pct/100) / price
+// - ORDER 및 FILL을 라벨로 표시, 우측 상단 디버그 테이블 제공.
+// ============================================================================
+
+// --------------------------- Inputs ---------------------------
+string htf = input.timeframe("240", "Signal TF (4H)")
+
+// Indicators
+int cciLen = input.int(20, "CCI Length", minval=1)
+int bbLen  = input.int(20, "BB Length", minval=1)
+float bbMult= input.float(2.0, "BB Mult", minval=0.1, step=0.1)
+int emaLen = input.int(200, "Daily EMA Length", minval=1)
+
+// Regime-based drop% (add-buy distance)
+float addDropUpPct = input.float(5.0, "Add-buy drop % (EMA200 ABOVE)", minval=0.1, step=0.1)
+float addDropDnPct = input.float(7.0, "Add-buy drop % (EMA200 BELOW)", minval=0.1, step=0.1)
+
+// Regime-based TP step%
+float tpStepUpPct  = input.float(5.0, "TP step % (EMA200 ABOVE)", minval=0.1, step=0.1)
+float tpStepDnPct  = input.float(7.0, "TP step % (EMA200 BELOW)", minval=0.1, step=0.1)
+
+// TP sell percent (position % per TP)
+float tpSellPctUp = input.float(5.0, "TP sell % (EMA200 ABOVE) (position %)", minval=0.1, step=0.1)
+float tpSellPctDn = input.float(5.0, "TP sell % (EMA200 BELOW) (position %)", minval=0.1, step=0.1)
+
+int tpMaxSteps = input.int(20, "TP steps (N)", minval=1, maxval=40)
+bool useCrossoverTP = input.bool(false, "TP trigger = crossover (B). Off = hit (A)")
+
+// Buy % per step (equity % used to compute qty)
+float pctUp_1 = input.float(0.5, "Step1 % (EMA200 above)", step=0.1)
+float pctUp_2 = input.float(1.0, "Step2 % (EMA200 above)", step=0.1)
+float pctUp_3 = input.float(2.0, "Step3 % (EMA200 above)", step=0.1)
+float pctUp_4 = input.float(2.0, "Step4 % (EMA200 above)", step=0.1)
+float pctUp_5 = input.float(4.0, "Step5 % (EMA200 above)", step=0.1)
+float pctUp_6 = input.float(8.0, "Step6 % (EMA200 above)", step=0.1)
+
+float pctDn_1 = input.float(1.0, "Step1 % (EMA200 below)", step=0.1)
+float pctDn_2 = input.float(2.0, "Step2 % (EMA200 below)", step=0.1)
+float pctDn_3 = input.float(4.0, "Step3 % (EMA200 below)", step=0.1)
+float pctDn_4 = input.float(4.0, "Step4 % (EMA200 below)", step=0.1)
+float pctDn_5 = input.float(8.0, "Step5 % (EMA200 below)", step=0.1)
+float pctDn_6 = input.float(16.0,"Step6 % (EMA200 below)", step=0.1)
+
+int maxCycleSteps = 6
+
+// Visual / debug
+bool showTradeLabels = input.bool(true, "Show trade labels")
+int maxLabels = input.int(200, "Max labels to keep", minval=10)
+bool showDebugTable = input.bool(true, "Show debug table")
+
+// --------------------------- Helper functions ---------------------------
+f_buyPct(int _step, bool _above200) =>
+    float out = na
+    if _above200
+        out := switch _step
+            1 => pctUp_1
+            2 => pctUp_2
+            3 => pctUp_3
+            4 => pctUp_4
+            5 => pctUp_5
+            6 => pctUp_6
+            => na
+    else
+        out := switch _step
+            1 => pctDn_1
+            2 => pctDn_2
+            3 => pctDn_3
+            4 => pctDn_4
+            5 => pctDn_5
+            6 => pctDn_6
+            => na
+    out
+
+// qty from equity pct, price px
+f_qtyFromPct(float pct, float px) =>
+    float cash = strategy.equity * (pct / 100.0)
+    float qty  = px > 0 ? cash / px : 0.0
+    qty
+
+f_addDrop(bool _above200) => _above200 ? addDropUpPct : addDropDnPct
+f_tpStep(bool _above200)  => _above200 ? tpStepUpPct  : tpStepDnPct
+f_tpSellPct(bool _above200) => _above200 ? tpSellPctUp : tpSellPctDn
+
+f_fmtQty(float q) => str.tostring(q, format.mintick)
+f_fmtPx(float p) => str.tostring(p, format.price)
+
+// --------------------------- HTF(4H) signal (종가 확정) ---------------------------
+int htfTime = request.security(syminfo.tickerid, htf, time, barmerge.gaps_off, barmerge.lookahead_off)
+bool newHTF = ta.change(htfTime) != 0
+
+float htfCCI   = request.security(syminfo.tickerid, htf, ta.cci(hlc3, cciLen), barmerge.gaps_off, barmerge.lookahead_off)
+float htfBasis = request.security(syminfo.tickerid, htf, ta.sma(close, bbLen), barmerge.gaps_off, barmerge.lookahead_off)
+float htfDev   = request.security(syminfo.tickerid, htf, bbMult * ta.stdev(close, bbLen), barmerge.gaps_off, barmerge.lookahead_off)
+float htfLower = htfBasis - htfDev
+float htfClose = request.security(syminfo.tickerid, htf, close, barmerge.gaps_off, barmerge.lookahead_off)
+
+bool sigHTF = (htfCCI <= -100) and (htfClose < htfLower)
+bool canAct = newHTF and sigHTF  // 4H 종가 확정 시에만 동작
+
+// --------------------------- Daily EMA200 regime ---------------------------
+float dEMA200 = request.security(syminfo.tickerid, "1D", ta.ema(close, emaLen), barmerge.gaps_off, barmerge.lookahead_off)
+float dClose  = request.security(syminfo.tickerid, "1D", close, barmerge.gaps_off, barmerge.lookahead_off)
+bool above200 = dClose >= dEMA200
+
+float dropPct = f_addDrop(above200)    // percent (e.g. 5 => 5%)
+float tpStepPct = f_tpStep(above200)   // percent
+float tpSellPct = f_tpSellPct(above200)
+
+// price used for buy trigger / qty calc (4H close)
+float pxBuy = htfClose
+
+// --------------------------- Cycle state (매수 전용, 체결 기준) ---------------------------
+var bool  cycleActive = false   // user intended cycle has started (order placed for C1)
+var int   cycleStep   = 0      // intended cycle step (1..6)
+var float cCost       = 0.0    // cycle cumulative cost (quote currency) - only updated on fills
+var float cQty        = 0.0    // cycle cumulative quantity - only updated on fills
+var float cAvg        = na     // cycle average price = cCost / cQty (used for triggers)
+var float cFirstPx    = na     // first fill price (set on first fill)
+
+// --------------------------- Global TP state (매도 전용) ---------------------------
+// tpBaseAvg: 전체평단 기준 - updated on each buy fill (posIncreased) from strategy.position_avg_price
+// tpNext: next TP step (1-based). Increase only on confirmed TP fill (posReduced that corresponds to a pending TP).
+// lastTPBar: bar_index of last TP order placement (to enforce 1 TP per bar)
+var float tpBaseAvg  = na
+var float tpBaseStep = na
+var int   tpNext     = 1
+var int   lastTPBar  = na
+
+// pending TP tracking
+var bool  tpPending      = false
+var float pendingSellQty = 0.0
+var int   pendingTPStep  = 0
+
+// lastBuyBar: bar_index where last buy fill happened (to prevent TP same bar)
+var int lastBuyBar = na
+
+// --------------------------- Order/Fill visual helpers ---------------------------
+var label[] tradeLabels = array.new<label>()
+f_pushLabel(label l) =>
+    array.push(tradeLabels, l)
+    if array.size(tradeLabels) > maxLabels
+        label.delete(array.shift(tradeLabels))
+
+// order visual flags (one-bar)
+var float lastOrderPrice = na
+var bool  orderPlacedNow = false
+
+var float buyFillPrice = na
+var float sellFillPrice = na
+
+// debug table
+var table dbg = na
+if showDebugTable and na(dbg)
+    dbg := table.new(position.top_right, 2, 8, border_width=1)
+
+// --------------------------- Position tracking ---------------------------
+float posNow  = strategy.position_size
+float posPrev = strategy.position_size[1]
+float dPos    = posNow - posPrev
+
+bool posIncreased = dPos > 0
+bool posReduced   = dPos < 0
+
+// --------------------------- posIncreased (매수 체결 발생) ---------------------------
+if posIncreased
+    // Update global TP base from exchange sim: strategy.position_avg_price
+    tpBaseAvg  := strategy.position_avg_price
+    tpBaseStep := tpStepPct
+    tpNext     := 1  // reset TP progression on any buy fill (per requirement)
+
+    // Calculate incremental fill info and update cycle accumulators only when cycleActive
+    float prevAvg = nz(strategy.position_avg_price[1], 0.0)
+    float newAvg  = nz(strategy.position_avg_price, 0.0)
+    float prevSize = nz(strategy.position_size[1], 0.0)
+    float newSize  = nz(strategy.position_size, 0.0)
+    float incQty = dPos
+    float incAvg = na
+    if incQty > 0
+        float incCost = (newAvg * newSize) - (prevAvg * prevSize)  // change in total position value
+        incAvg := incCost / incQty
+        if prevSize == 0
+            // first fill for this position
+            if cycleActive
+                cQty := incQty
+                cCost := incCost
+                cAvg := cQty > 0 ? (cCost / cQty) : na
+                cFirstPx := incAvg
+            else
+                // non-cycle buy (external) -> don't populate cycle vars
+                na
+        else
+            // additional fill on existing position
+            if cycleActive
+                cCost := nz(cCost) + incCost
+                cQty  := nz(cQty)  + incQty
+                cAvg  := cQty > 0 ? (cCost / cQty) : na
+                if na(cFirstPx)
+                    cFirstPx := incAvg
+
+    // record the bar of buy fill
+    lastBuyBar := bar_index
+
+    // draw FILL BUY label (large)
+    if showTradeLabels and not na(incAvg)
+        buyFillPrice := incAvg
+        string lbTxt = "FILL BUY\nqty=" + f_fmtQty(incQty) + "\npx=" + f_fmtPx(incAvg)
+        label lb = label.new(bar_index, incAvg, lbTxt, yloc=yloc.price, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.large)
+        f_pushLabel(lb)
+
+// --------------------------- posReduced (매도 체결 발생) ---------------------------
+if posReduced
+    // any reduction ends current cycle intent
+    cycleActive := false
+    cycleStep   := 0
+    cCost       := 0.0
+    cQty        := 0.0
+    cAvg        := na
+    cFirstPx    := na
+
+    float reducedQty = -dPos
+
+    // draw FILL SELL label at close (approximate fill price)
+    if showTradeLabels and reducedQty > 0
+        sellFillPrice := close
+        string lsTxt = "FILL SELL\nqty=" + f_fmtQty(reducedQty) + "\npx=" + f_fmtPx(close)
+        label ls = label.new(bar_index, close, lsTxt, yloc=yloc.price, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.large)
+        f_pushLabel(ls)
+
+    // handle pending TP: if a TP was pending, assume this reduction is that TP executed
+    if tpPending and reducedQty > 0
+        tpPending := false
+        pendingSellQty := 0.0
+        pendingTPStep  := 0
+        tpNext += 1
+        // If that executed TP was TP1, cycle resets already done above (cycle vars cleared)
+
+    // If fully flat, reset TP base per logic
+    if strategy.position_size == 0
+        tpBaseAvg  := na
+        tpBaseStep := na
+        tpNext     := 1
+        lastTPBar  := na
+        tpPending  := false
+        pendingSellQty := 0.0
+        pendingTPStep  := 0
+        lastBuyBar := na
+
+// --------------------------- Entries (주문 발행) ---------------------------
+// 1) Start cycle (C1) - can place even if position exists; cycleActive toggles intent
+if canAct and not cycleActive
+    // avoid placing if we had a buy fill in this bar (prevents same-bar double)
+    if nz(lastBuyBar, -1) != bar_index
+        float pct = f_buyPct(1, above200)
+        if not na(pct) and pct > 0
+            float qty = f_qtyFromPct(pct, pxBuy)
+            if qty > 0
+                strategy.order("C1", strategy.long, qty=qty)
+                cycleActive := true
+                cycleStep   := 1
+                // show ORDER label
+                if showTradeLabels
+                    string ordTxt = "ORDER C1\nqty=" + f_fmtQty(qty) + "\npx=" + f_fmtPx(pxBuy)
+                    label lord = label.new(bar_index, low, ordTxt, yloc=yloc.belowbar, style=label.style_label_left, color=color.new(color.blue, 0), textcolor=color.white, size=size.normal)
+                    f_pushLabel(lord)
+            else
+                if showTradeLabels
+                    label.new(bar_index, low, "ORDER C1 qty=0", yloc=yloc.belowbar, color=color.orange, textcolor=color.white, size=size.tiny)
+
+// 2) C2 trigger: cFirstPx 기준 -dropPct and 4H signal must still hold
+if canAct and cycleActive and cycleStep == 1 and not na(cFirstPx)
+    if nz(lastBuyBar, -1) != bar_index
+        float trig2 = cFirstPx * (1.0 - dropPct / 100.0)
+        if pxBuy <= trig2
+            float pct = f_buyPct(2, above200)
+            if not na(pct) and pct > 0
+                float qty = f_qtyFromPct(pct, pxBuy)
+                if qty > 0
+                    strategy.order("C2", strategy.long, qty=qty)
+                    cycleStep := 2
+                    if showTradeLabels
+                        string ordTxt2 = "ORDER C2\nqty=" + f_fmtQty(qty) + "\npx=" + f_fmtPx(pxBuy)
+                        label l2 = label.new(bar_index, low, ordTxt2, yloc=yloc.belowbar, style=label.style_label_left, color=color.new(color.blue, 0), textcolor=color.white, size=size.normal)
+                        f_pushLabel(l2)
+                else
+                    if showTradeLabels
+                        label.new(bar_index, low, "ORDER C2 qty=0", yloc=yloc.belowbar, color=color.orange, textcolor=color.white, size=size.tiny)
+
+// 3..6: additional buys relative to cAvg
+if canAct and cycleActive and cycleStep >= 2 and cycleStep <= (maxCycleSteps - 1) and not na(cAvg)
+    if nz(lastBuyBar, -1) != bar_index
+        float trig = cAvg * (1.0 - dropPct / 100.0)
+        if pxBuy <= trig
+            int nextStep = cycleStep + 1
+            if nextStep <= maxCycleSteps
+                float pct = f_buyPct(nextStep, above200)
+                if not na(pct) and pct > 0
+                    float qty = f_qtyFromPct(pct, pxBuy)
+                    if qty > 0
+                        strategy.order("C" + str.tostring(nextStep), strategy.long, qty=qty)
+                        cycleStep := nextStep
+                        if showTradeLabels
+                            string ordTxtN = "ORDER C" + str.tostring(nextStep) + "\nqty=" + f_fmtQty(qty) + "\npx=" + f_fmtPx(pxBuy)
+                            label ln = label.new(bar_index, low, ordTxtN, yloc=yloc.belowbar, style=label.style_label_left, color=color.new(color.blue, 0), textcolor=color.white, size=size.normal)
+                            f_pushLabel(ln)
+                    else
+                        if showTradeLabels
+                            label.new(bar_index, low, "ORDER C" + str.tostring(nextStep) + " qty=0", yloc=yloc.belowbar, color=color.orange, textcolor=color.white, size=size.tiny)
+
+// --------------------------- TP logic (매도) ---------------------------
+// canSell only when position exists and tpBaseAvg is set and tpNext in range
+bool canSell = (strategy.position_size > 0) and (not na(tpBaseAvg)) and (tpNext <= tpMaxSteps)
+bool sameBarAsLastBuy = (nz(lastBuyBar, -1) == bar_index)
+
+if canSell
+    float target = tpBaseAvg * (1.0 + (tpStepPct / 100.0) * tpNext)
+    bool hit = useCrossoverTP ? ((close[1] < target) and (close >= target)) : (close >= target)
+    if hit and (nz(lastTPBar, -1) != bar_index) and not tpPending and not sameBarAsLastBuy
+        // sell qty = position_size * tpSellPct/100 (position %)
+        float sellQty = strategy.position_size * (tpSellPct / 100.0)
+        sellQty := math.max(0.0, math.min(sellQty, strategy.position_size))
+        if sellQty > 0
+            strategy.order("TP" + str.tostring(tpNext), strategy.short, qty=sellQty)
+            tpPending := true
+            pendingSellQty := sellQty
+            pendingTPStep  := tpNext
+            lastTPBar := bar_index
+            if showTradeLabels
+                string ottp = "ORDER TP" + str.tostring(tpNext) + "\nqty=" + f_fmtQty(sellQty) + "\ntarget=" + f_fmtPx(target)
+                label ltp = label.new(bar_index, high, ottp, yloc=yloc.abovebar, style=label.style_label_right, color=color.new(color.purple, 0), textcolor=color.white, size=size.normal)
+                f_pushLabel(ltp)
+        else
+            if showTradeLabels
+                label.new(bar_index, high, "ORDER TP qty=0", yloc=yloc.abovebar, color=color.orange, textcolor=color.white, size=size.tiny)
+
+// --------------------------- DEBUG: table & housekeeping ---------------------------
+if showDebugTable and not na(dbg)
+    table.cell(dbg, 0, 0, "Key", bgcolor=color.new(color.gray, 90))
+    table.cell(dbg, 1, 0, "Value", bgcolor=color.new(color.gray, 85))
+    table.cell(dbg, 0, 1, "posSize")
+    table.cell(dbg, 1, 1, str.tostring(strategy.position_size, format.mintick))
+    table.cell(dbg, 0, 2, "tpBaseAvg")
+    table.cell(dbg, 1, 2, na(tpBaseAvg) ? "na" : f_fmtPx(tpBaseAvg))
+    table.cell(dbg, 0, 3, "tpNext")
+    table.cell(dbg, 1, 3, str.tostring(tpNext))
+    table.cell(dbg, 0, 4, "tpPending")
+    table.cell(dbg, 1, 4, tpPending ? "Y" : "N")
+    table.cell(dbg, 0, 5, "lastBuyBar")
+    table.cell(dbg, 1, 5, str.tostring(nz(lastBuyBar, -1)))
+    table.cell(dbg, 0, 6, "lastTPBar")
+    table.cell(dbg, 1, 6, str.tostring(nz(lastTPBar, -1)))
+    table.cell(dbg, 0, 7, "cAvg")
+    table.cell(dbg, 1, 7, na(cAvg) ? "na" : f_fmtPx(cAvg))
+
+// --------------------------- Visual plots ---------------------------
+plot(dEMA200, "Daily EMA200", color=color.new(color.orange, 0))
+plot(cAvg, title="cAvg (Cycle Avg)", color=color.new(color.blue, 0))
+plot(tpBaseAvg, title="tpBaseAvg (Global TP Base)", color=color.new(color.fuchsia, 0))
+plot(htfLower, title="HTF BB Lower", color=color.new(color.aqua, 0))
+
+// status label for last bar
+var label stLbl = na
+if barstate.islast
+    label.delete(stLbl)
+    string s = "pos=" + str.tostring(strategy.position_size, format.mintick) +
+       " cAvg=" + (na(cAvg) ? "na" : f_fmtPx(cAvg)) +
+       " cFirst=" + (na(cFirstPx) ? "na" : f_fmtPx(cFirstPx)) +
+       " tpBase=" + (na(tpBaseAvg) ? "na" : f_fmtPx(tpBaseAvg)) +
+       " tpNext=" + str.tostring(tpNext) +
+       " tpPending=" + (tpPending ? "Y" : "N") +
+       " lastBuyBar=" + str.tostring(nz(lastBuyBar, -1)) +
+       " lastTPBar=" + str.tostring(nz(lastTPBar, -1))
+    stLbl := label.new(bar_index, high, s, yloc=yloc.abovebar, style=label.style_label_left, color=color.new(color.gray, 85), textcolor=color.white, size=size.small)
+
+// ============================================================================
+// Notes / Behavior summary (important)
+// - cAvg/cCost/cQty/cFirstPx are only updated when posIncreased (real fills) occur.
+// - tpBaseAvg is updated on every buy fill (posIncreased) from strategy.position_avg_price.
+// - tpNext only increments when a pending TP was filled (posReduced observed while tpPending is true).
+// - One TP order per bar (lastTPBar prevents repeats) and no TP on the same bar as a buy fill (lastBuyBar).
+// - All order quantities use qty (not qty_percent). Buy qty = (equity * pct/100) / pxBuy. TP qty = position * tpSellPct%.
+// - If you want ORDER markers for every placed order independent of fills, enable showTradeLabels and inspect labels.
+// ============================================================================
